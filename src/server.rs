@@ -14,6 +14,7 @@
 
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
+use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
     CompilerProxy, DistType, Language, MissType, get_compiler_info,
@@ -24,7 +25,9 @@ use crate::config::Config;
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
-use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
+use crate::protocol::{
+    Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
+};
 use crate::util;
 #[cfg(feature = "dist-client")]
 use anyhow::Context as _;
@@ -34,7 +37,7 @@ use fs::metadata;
 use fs_err as fs;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
-use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future, stream};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future};
 use number_prefix::NumberPrefix;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -898,6 +901,84 @@ where
                         Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
                     })
                 }
+                Request::StorageHandshake => {
+                    debug!("handle_client: storage_handshake");
+                    let info = StorageHandshakeInfo {
+                        location: me.storage.location(),
+                        cache_type_name: me.storage.cache_type_name().to_owned(),
+                        basedirs: me.storage.basedirs().to_vec(),
+                        preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
+                        cache_mode: me.storage.check().await.unwrap_or(CacheMode::ReadWrite),
+                        max_size: me.storage.max_size().await.unwrap_or(None),
+                    };
+                    Ok(Message::WithoutBody(Response::StorageHandshake(info)))
+                }
+                Request::StorageGetPath { key } => {
+                    debug!("handle_client: storage_get_path key={}", key);
+                    Ok(Message::WithoutBody(Response::StorageGetPath(
+                        me.storage.get_path(&key).await,
+                    )))
+                }
+                Request::StorageGetRaw { key } => {
+                    debug!("handle_client: storage_get_raw key={}", key);
+                    let resp = match me.storage.get_raw(&key).await {
+                        Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
+                        Err(e) => {
+                            warn!("storage_get_raw error: {e:#}");
+                            Response::StorageGetRaw(None)
+                        }
+                    };
+                    Ok(Message::WithoutBody(resp))
+                }
+                Request::StoragePutRaw { key, data } => {
+                    debug!("handle_client: storage_put_raw key={}", key);
+                    let result = me
+                        .storage
+                        .put_raw(&key, data.into())
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"));
+                    Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
+                }
+                Request::StorageGetPreprocessorEntry { key } => {
+                    debug!("handle_client: storage_get_preprocessor_entry key={}", key);
+                    let result = me
+                        .storage
+                        .get_preprocessor_cache_entry(&key)
+                        .await
+                        .map(|opt| {
+                            opt.and_then(|mut seekable| {
+                                use std::io::Read;
+                                let mut buf = vec![];
+                                seekable.read_to_end(&mut buf).ok()?;
+                                Some(buf)
+                            })
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                    Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
+                        result,
+                    )))
+                }
+                Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
+                    debug!("handle_client: storage_put_preprocessor_entry key={}", key);
+                    let result = async {
+                        let entry = PreprocessorCacheEntry::read(&entry_bytes)
+                            .map_err(|e| format!("{e:#}"))?;
+                        me.storage
+                            .put_preprocessor_cache_entry(&key, entry)
+                            .await
+                            .map_err(|e| format!("{e:#}"))
+                    }
+                    .await;
+                    Ok(Message::WithoutBody(Response::StoragePutPreprocessorEntry(
+                        result,
+                    )))
+                }
+                Request::RecordStats(delta) => {
+                    debug!("handle_client: record_stats");
+                    me.merge_stats(*delta).await;
+                    Ok(Message::WithoutBody(Response::RecordStats))
+                }
             }
         })
     }
@@ -908,7 +989,6 @@ where
 }
 
 use futures::TryStreamExt;
-use futures::future::Either;
 
 impl<C> SccacheService<C>
 where
@@ -991,7 +1071,7 @@ where
         }
     }
 
-    fn bind<T>(self, socket: T) -> impl Future<Output = Result<()>> + Send + Sized + 'static
+    async fn bind<T>(self, socket: T) -> Result<()>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1005,36 +1085,52 @@ where
         }
         let io = builder.new_framed(socket);
 
-        let (sink, stream) = SccacheTransport {
+        let (sink, mut stream) = SccacheTransport {
             inner: Framed::new(io.sink_err_into().err_into(), BincodeCodec),
         }
         .split();
-        let sink = sink.sink_err_into::<Error>();
+        let mut sink = sink.sink_err_into::<Error>();
+
+        let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let me = Arc::new(self);
-        stream
-            .err_into::<Error>()
-            .and_then(move |input| me.clone().call(input))
-            .and_then(move |response| async move {
-                let fut = match response {
+
+        // The reader loop below feeds requests into `reqs_tx`; this task drains
+        // them, calls the service, and writes responses back to the sink.
+        //
+        // `_handle` must stay bound for the lifetime of `bind` (not `let _ =`,
+        // which would drop it immediately): it is an `AbortOnDropHandle`, so
+        // dropping it aborts this task and its in-flight compile subtasks. That
+        // is the cancellation we want once the client disconnects and the reader
+        // loop below exits.
+        let _handle = util::spawn(async move {
+            while let Some(req) = reqs_rx.recv().await {
+                match util::spawn(me.clone().call(req)).await?? {
                     Message::WithoutBody(message) => {
-                        let stream = stream::once(async move { Ok(Frame::Message { message }) });
-                        Either::Left(stream)
+                        sink.send(Frame::Message { message }).await?;
                     }
                     Message::WithBody(message, body) => {
-                        let stream = stream::once(async move { Ok(Frame::Message { message }) })
-                            .chain(
-                                body.into_stream()
-                                    .map_ok(|chunk| Frame::Body { chunk: Some(chunk) }),
-                            )
-                            .chain(stream::once(async move { Ok(Frame::Body { chunk: None }) }));
-                        Either::Right(stream)
+                        sink.send(Frame::Message { message }).await?;
+                        sink.send(Frame::Body {
+                            chunk: Some(util::spawn(body).await??),
+                        })
+                        .await?;
+                        sink.send(Frame::Body { chunk: None }).await?;
                     }
-                };
-                Ok(Box::pin(fut))
-            })
-            .try_flatten()
-            .forward(sink)
+                }
+            }
+
+            Ok::<_, Error>(())
+        });
+
+        // Read requests until the client disconnects (stream ends) or the
+        // stream errors. A send error means the handler task above has ended,
+        // so we stop reading in that case too.
+        while let Some(req) = stream.next().await {
+            reqs_tx.send(req?)?;
+        }
+
+        Ok(())
     }
 
     /// Get dist status.
@@ -1053,6 +1149,16 @@ where
         *self.stats.lock().await = ServerStats::default();
     }
 
+    /// Snapshot and reset the current stats (used by client-side processes before exit).
+    pub async fn take_stats(&self) -> ServerStats {
+        let mut s = self.stats.lock().await;
+        std::mem::take(&mut *s)
+    }
+
+    async fn merge_stats(&self, delta: ServerStats) {
+        *self.stats.lock().await += delta;
+    }
+
     /// Handle a compile request from a client.
     ///
     /// This will handle a compile request entirely, generating a response with
@@ -1069,6 +1175,27 @@ where
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
             .await;
         Ok(me.check_compiler(info, cmd, cwd, env_vars).await)
+    }
+
+    /// Run a compile entirely in the current process (used in client-side mode).
+    ///
+    /// Returns the `CompileResponse` variant and, when compilation started, the
+    /// accompanying `CompileFinished` result.
+    pub async fn compile_direct(
+        &self,
+        compile: Compile,
+    ) -> Result<(CompileResponse, Option<CompileFinished>)> {
+        match self.handle_compile(compile).await? {
+            Message::WithBody(Response::Compile(resp), body) => {
+                let finished = match body.await? {
+                    Response::CompileFinished(f) => f,
+                    _ => bail!("unexpected body response from compile_direct"),
+                };
+                Ok((resp, Some(finished)))
+            }
+            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
+            _ => bail!("unexpected response from handle_compile in compile_direct"),
+        }
     }
 
     /// Look up compiler info from the cache for the compiler `path`.
@@ -1333,215 +1460,213 @@ where
 
         let me = self.clone();
 
-        self.rt
-            .spawn(async move {
-                let result = match me.dist_client.get_client().await {
-                    Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
-                        &me,
-                        client,
-                        me.creator.clone(),
-                        me.storage.clone(),
-                        arguments,
-                        cwd,
-                        env_vars,
-                        cache_control,
-                        me.rt.clone(),
-                    ))
-                    .catch_unwind()
-                    .await
-                    .map_err(|e| {
-                        let panic = e
-                            .downcast_ref::<&str>()
-                            .map(|s| &**s)
-                            .or_else(|| e.downcast_ref::<String>().map(|s| &**s))
-                            .unwrap_or("An unknown panic was caught.");
-                        let thread = std::thread::current();
-                        let thread_name = thread.name().unwrap_or("unnamed");
-                        if let Some((file, line, column)) = PANIC_LOCATION.with(|l| l.take()) {
-                            anyhow!(
-                                "thread '{thread_name}' panicked at {file}:{line}:{column}: {panic}"
-                            )
-                        } else {
-                            anyhow!("thread '{thread_name}' panicked: {panic}")
-                        }
-                    })
-                    .and_then(std::convert::identity),
-                    Err(e) => Err(e),
-                };
-
-                let mut cache_write = None;
-                let mut res = CompileFinished {
-                    color_mode,
-                    ..Default::default()
-                };
-
-                let mut stats = me.stats.lock().await;
-
-                match result {
-                    Ok((compiled, out)) => {
-                        let mut dist_type = DistType::NoDist;
-
-                        match compiled {
-                            CompileResult::Error => {
-                                debug!("compile result: cache error");
-
-                                stats.cache_errors.increment(&kind, &lang);
-                            }
-                            CompileResult::CacheHit(duration) => {
-                                debug!("compile result: cache hit");
-
-                                stats.cache_hits.increment(&kind, &lang);
-                                stats.cache_read_hit_duration += duration;
-                            }
-                            CompileResult::CacheMiss(miss_type, dt, duration, future) => {
-                                debug!("[{}]: compile result: cache miss", out_pretty);
-                                dist_type = dt;
-
-                                match miss_type {
-                                    MissType::Normal => {}
-                                    MissType::ForcedNoCache => {}
-                                    MissType::ForcedRecache => {
-                                        stats.forced_recaches += 1;
-                                    }
-                                    MissType::TimedOut => {
-                                        stats.cache_timeouts += 1;
-                                    }
-                                    MissType::CacheReadError => {
-                                        stats.cache_errors.increment(&kind, &lang);
-                                    }
-                                }
-                                stats.compilations += 1;
-                                stats.cache_misses.increment(&kind, &lang);
-                                stats.compiler_write_duration += duration;
-                                debug!("stats after compile result: {stats:?}");
-                                cache_write = Some(future);
-                            }
-                            CompileResult::NotCached(dt, duration) => {
-                                debug!("[{}]: compile result: not cached", out_pretty);
-                                dist_type = dt;
-                                stats.compilations += 1;
-                                stats.compiler_write_duration += duration;
-                            }
-                            CompileResult::NotCacheable(dt, duration) => {
-                                debug!("[{}]: compile result: not cacheable", out_pretty);
-                                dist_type = dt;
-                                stats.compilations += 1;
-                                stats.compiler_write_duration += duration;
-                                stats.non_cacheable_compilations += 1;
-                            }
-                            CompileResult::CompileFailed(dt, duration) => {
-                                debug!("[{}]: compile result: compile failed", out_pretty);
-                                dist_type = dt;
-                                stats.compilations += 1;
-                                stats.compiler_write_duration += duration;
-                                stats.compile_fails += 1;
-                            }
-                        }
-
-                        match dist_type {
-                            DistType::NoDist => {}
-                            DistType::Ok(id) => {
-                                let server = id.addr().to_string();
-                                let server_count = stats.dist_compiles.entry(server).or_insert(0);
-                                *server_count += 1;
-                            }
-                            DistType::Error => stats.dist_errors += 1,
-                        }
-
-                        // Make sure the write guard has been dropped ASAP.
-                        drop(stats);
-
-                        let Output {
-                            status,
-                            stdout,
-                            stderr,
-                        } = out;
-
-                        trace!("CompileFinished retcode: {}", status);
-
-                        match status.code() {
-                            Some(code) => res.retcode = Some(code),
-                            None => res.signal = Some(get_signal(status)),
-                        }
-
-                        res.stdout = stdout;
-                        res.stderr = stderr;
+        util::spawn_on(&self.rt, async move {
+            let result = match me.dist_client.get_client().await {
+                Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
+                    &me,
+                    client,
+                    me.creator.clone(),
+                    me.storage.clone(),
+                    arguments,
+                    cwd,
+                    env_vars,
+                    cache_control,
+                    me.rt.clone(),
+                ))
+                .catch_unwind()
+                .await
+                .map_err(|e| {
+                    let panic = e
+                        .downcast_ref::<&str>()
+                        .map(|s| &**s)
+                        .or_else(|| e.downcast_ref::<String>().map(|s| &**s))
+                        .unwrap_or("An unknown panic was caught.");
+                    let thread = std::thread::current();
+                    let thread_name = thread.name().unwrap_or("unnamed");
+                    if let Some((file, line, column)) = PANIC_LOCATION.with(|l| l.take()) {
+                        anyhow!(
+                            "thread '{thread_name}' panicked at {file}:{line}:{column}: {panic}"
+                        )
+                    } else {
+                        anyhow!("thread '{thread_name}' panicked: {panic}")
                     }
-                    Err(err) => {
-                        match err.downcast::<ProcessError>() {
-                            Ok(ProcessError(output)) => {
-                                debug!("Compilation failed: {:?}", output);
-                                stats.compile_fails += 1;
+                })
+                .and_then(std::convert::identity),
+                Err(e) => Err(e),
+            };
+
+            let mut cache_write = None;
+            let mut res = CompileFinished {
+                color_mode,
+                ..Default::default()
+            };
+
+            let mut stats = me.stats.lock().await;
+
+            match result {
+                Ok((compiled, out)) => {
+                    let mut dist_type = DistType::NoDist;
+
+                    match compiled {
+                        CompileResult::Error => {
+                            debug!("[{}]: compile result: cache error", out_pretty);
+
+                            stats.cache_errors.increment(&kind, &lang);
+                        }
+                        CompileResult::CacheHit(duration) => {
+                            debug!("[{}]: compile result: cache hit", out_pretty);
+
+                            stats.cache_hits.increment(&kind, &lang);
+                            stats.cache_read_hit_duration += duration;
+                        }
+                        CompileResult::CacheMiss(miss_type, dt, duration, future) => {
+                            debug!("[{}]: compile result: cache miss", out_pretty);
+                            dist_type = dt;
+
+                            match miss_type {
+                                MissType::Normal => {}
+                                MissType::ForcedNoCache => {}
+                                MissType::ForcedRecache => {
+                                    stats.forced_recaches += 1;
+                                }
+                                MissType::TimedOut => {
+                                    stats.cache_timeouts += 1;
+                                }
+                                MissType::CacheReadError => {
+                                    stats.cache_errors.increment(&kind, &lang);
+                                }
+                            }
+                            stats.compilations += 1;
+                            stats.cache_misses.increment(&kind, &lang);
+                            stats.compiler_write_duration += duration;
+                            debug!("stats after compile result: {stats:?}");
+                            cache_write = Some(future);
+                        }
+                        CompileResult::NotCached(dt, duration) => {
+                            debug!("[{}]: compile result: not cached", out_pretty);
+                            dist_type = dt;
+                            stats.compilations += 1;
+                            stats.compiler_write_duration += duration;
+                        }
+                        CompileResult::NotCacheable(dt, duration) => {
+                            debug!("[{}]: compile result: not cacheable", out_pretty);
+                            dist_type = dt;
+                            stats.compilations += 1;
+                            stats.compiler_write_duration += duration;
+                            stats.non_cacheable_compilations += 1;
+                        }
+                        CompileResult::CompileFailed(dt, duration) => {
+                            debug!("[{}]: compile result: compile failed", out_pretty);
+                            dist_type = dt;
+                            stats.compilations += 1;
+                            stats.compiler_write_duration += duration;
+                            stats.compile_fails += 1;
+                        }
+                    }
+
+                    match dist_type {
+                        DistType::NoDist => {}
+                        DistType::Ok(id) => {
+                            let server = id.addr().to_string();
+                            let server_count = stats.dist_compiles.entry(server).or_insert(0);
+                            *server_count += 1;
+                        }
+                        DistType::Error => stats.dist_errors += 1,
+                    }
+
+                    // Make sure the write guard has been dropped ASAP.
+                    drop(stats);
+
+                    let Output {
+                        status,
+                        stdout,
+                        stderr,
+                    } = out;
+
+                    trace!("CompileFinished retcode: {}", status);
+
+                    match status.code() {
+                        Some(code) => res.retcode = Some(code),
+                        None => res.signal = Some(get_signal(status)),
+                    }
+
+                    res.stdout = stdout;
+                    res.stderr = stderr;
+                }
+                Err(err) => {
+                    match err.downcast::<ProcessError>() {
+                        Ok(ProcessError(output)) => {
+                            debug!("Compilation failed: {:?}", output);
+                            stats.compile_fails += 1;
+                            // Make sure the write guard has been dropped ASAP.
+                            drop(stats);
+
+                            match output.status.code() {
+                                Some(code) => res.retcode = Some(code),
+                                None => res.signal = Some(get_signal(output.status)),
+                            }
+                            res.stdout = output.stdout;
+                            res.stderr = output.stderr;
+                        }
+                        Err(err) => match err.downcast::<HttpClientError>() {
+                            Ok(HttpClientError(msg)) => {
+                                // Make sure the write guard has been dropped ASAP.
+                                drop(stats);
+                                me.dist_client.reset_state().await;
+                                let errmsg =
+                                    format!("[{:?}] http error status: {}", out_pretty, msg);
+                                error!("{}", errmsg);
+                                res.retcode = Some(1);
+                                res.stderr = errmsg.as_bytes().to_vec();
+                            }
+                            Err(err) => {
+                                stats.cache_errors.increment(&kind, &lang);
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
 
-                                match output.status.code() {
-                                    Some(code) => res.retcode = Some(code),
-                                    None => res.signal = Some(get_signal(output.status)),
+                                use std::fmt::Write;
+
+                                error!("[{:?}] fatal error: {}", out_pretty, err);
+
+                                let mut error = "sccache: encountered fatal error\n".to_string();
+                                let _ = writeln!(error, "sccache: error: {}", err);
+                                for e in err.chain() {
+                                    error!("[{:?}] \t{}", out_pretty, e);
+                                    let _ = writeln!(error, "sccache: caused by: {}", e);
                                 }
-                                res.stdout = output.stdout;
-                                res.stderr = output.stderr;
+                                //TODO: figure out a better way to communicate this?
+                                res.retcode = Some(-2);
+                                res.stderr = error.into_bytes();
                             }
-                            Err(err) => match err.downcast::<HttpClientError>() {
-                                Ok(HttpClientError(msg)) => {
-                                    // Make sure the write guard has been dropped ASAP.
-                                    drop(stats);
-                                    me.dist_client.reset_state().await;
-                                    let errmsg =
-                                        format!("[{:?}] http error status: {}", out_pretty, msg);
-                                    error!("{}", errmsg);
-                                    res.retcode = Some(1);
-                                    res.stderr = errmsg.as_bytes().to_vec();
-                                }
-                                Err(err) => {
-                                    stats.cache_errors.increment(&kind, &lang);
-                                    // Make sure the write guard has been dropped ASAP.
-                                    drop(stats);
-
-                                    use std::fmt::Write;
-
-                                    error!("[{:?}] fatal error: {}", out_pretty, err);
-
-                                    let mut error =
-                                        "sccache: encountered fatal error\n".to_string();
-                                    let _ = writeln!(error, "sccache: error: {}", err);
-                                    for e in err.chain() {
-                                        error!("[{:?}] \t{}", out_pretty, e);
-                                        let _ = writeln!(error, "sccache: caused by: {}", e);
-                                    }
-                                    //TODO: figure out a better way to communicate this?
-                                    res.retcode = Some(-2);
-                                    res.stderr = error.into_bytes();
-                                }
-                            },
-                        }
+                        },
                     }
                 }
+            }
 
-                if let Some(cache_write) = cache_write {
-                    match cache_write.await {
-                        Err(e) => {
-                            debug!("Error executing cache write: {}", e);
-                            me.stats.lock().await.cache_write_errors += 1;
-                        }
-                        //TODO: save cache stats!
-                        Ok(info) => {
-                            debug!(
-                                "[{}]: Cache write finished in {}",
-                                info.object_file_pretty,
-                                util::fmt_duration_as_secs(&info.duration)
-                            );
-                            let mut stats = me.stats.lock().await;
-                            stats.cache_writes += 1;
-                            stats.cache_write_duration += info.duration;
-                        }
+            if let Some(cache_write) = cache_write {
+                match cache_write.await {
+                    Err(e) => {
+                        debug!("Error executing cache write: {}", e);
+                        me.stats.lock().await.cache_write_errors += 1;
+                    }
+                    //TODO: save cache stats!
+                    Ok(info) => {
+                        debug!(
+                            "[{}]: Cache write finished in {}",
+                            info.object_file_pretty,
+                            util::fmt_duration_as_secs(&info.duration)
+                        );
+                        let mut stats = me.stats.lock().await;
+                        stats.cache_writes += 1;
+                        stats.cache_write_duration += info.duration;
                     }
                 }
+            }
 
-                Ok(res)
-            })
-            .map_err(anyhow::Error::new)
-            .await?
+            Ok(res)
+        })
+        .map_err(anyhow::Error::new)
+        .await?
     }
 }
 
@@ -1576,6 +1701,17 @@ impl PerLanguageCount {
 
     pub fn new() -> PerLanguageCount {
         Self::default()
+    }
+}
+
+impl std::ops::AddAssign for PerLanguageCount {
+    fn add_assign(&mut self, rhs: Self) {
+        for (k, v) in rhs.counts {
+            *self.counts.entry(k).or_default() += v;
+        }
+        for (k, v) in rhs.adv_counts {
+            *self.adv_counts.entry(k).or_default() += v;
+        }
     }
 }
 
@@ -1627,6 +1763,47 @@ pub struct ServerStats {
     pub dist_compiles: HashMap<String, usize>,
     /// The count of compilations that were distributed but failed and had to be re-run locally
     pub dist_errors: u64,
+    /// Multi-level cache statistics (if multi-level caching is enabled)
+    pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+}
+
+impl std::ops::AddAssign for ServerStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.compile_requests += rhs.compile_requests;
+        self.requests_unsupported_compiler += rhs.requests_unsupported_compiler;
+        self.requests_not_compile += rhs.requests_not_compile;
+        self.requests_not_cacheable += rhs.requests_not_cacheable;
+        self.requests_executed += rhs.requests_executed;
+        self.cache_errors += rhs.cache_errors;
+        self.cache_hits += rhs.cache_hits;
+        self.cache_misses += rhs.cache_misses;
+        self.cache_timeouts += rhs.cache_timeouts;
+        self.cache_read_errors += rhs.cache_read_errors;
+        self.non_cacheable_compilations += rhs.non_cacheable_compilations;
+        self.forced_recaches += rhs.forced_recaches;
+        self.cache_write_errors += rhs.cache_write_errors;
+        self.cache_writes += rhs.cache_writes;
+        self.cache_write_duration += rhs.cache_write_duration;
+        self.cache_read_hit_duration += rhs.cache_read_hit_duration;
+        self.compilations += rhs.compilations;
+        self.compiler_write_duration += rhs.compiler_write_duration;
+        self.compile_fails += rhs.compile_fails;
+        for (k, v) in rhs.not_cached {
+            *self.not_cached.entry(k).or_default() += v;
+        }
+        for (k, v) in rhs.dist_compiles {
+            *self.dist_compiles.entry(k).or_default() += v;
+        }
+        self.dist_errors += rhs.dist_errors;
+        self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
+            (Some(mut a), Some(b)) => {
+                a += b;
+                Some(a)
+            }
+            (a, None) => a,
+            (None, b) => b,
+        };
+    }
 }
 
 /// Info and stats about the server.
@@ -1676,6 +1853,7 @@ impl Default for ServerStats {
             not_cached: HashMap::new(),
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
+            multi_level: None,
         }
     }
 }
@@ -1811,6 +1989,14 @@ impl ServerStats {
             self.dist_errors,
             "Failed distributed compilations"
         );
+
+        // Add multi-level cache statistics if available
+        if let Some(ref ml_stats) = self.multi_level {
+            for (name, value, suffix_type) in ml_stats.format_stats() {
+                stats_vec.push((name, value, suffix_type));
+            }
+        }
+
         let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap();
         let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap();
         for (name, stat, suffix_len) in stats_vec {
@@ -1936,6 +2122,7 @@ impl ServerInfo {
         let cache_size;
         let max_cache_size;
         let basedirs;
+        let multi_level;
         if let Some(storage) = storage {
             cache_location = storage.location();
             use_preprocessor_cache_mode = storage
@@ -1948,16 +2135,21 @@ impl ServerInfo {
                 .iter()
                 .map(|p| String::from_utf8_lossy(p).to_string())
                 .collect();
+            multi_level = storage.multilevel_stats();
         } else {
             cache_location = String::new();
             use_preprocessor_cache_mode = false;
             cache_size = None;
             max_cache_size = None;
             basedirs = Vec::new();
+            multi_level = None;
         }
         let version = env!("CARGO_PKG_VERSION").to_string();
         Ok(ServerInfo {
-            stats,
+            stats: ServerStats {
+                multi_level,
+                ..stats
+            },
             cache_location,
             cache_size,
             max_cache_size,
@@ -1976,6 +2168,16 @@ impl ServerInfo {
             self.cache_location,
             name_width = name_width
         );
+        if let Some(ref ml_stats) = self.stats.multi_level {
+            for level in &ml_stats.0 {
+                println!(
+                    "{:<name_width$} {}",
+                    format!("  {}", level.name),
+                    level.location,
+                    name_width = name_width
+                );
+            }
+        }
         println!(
             "{:<name_width$} {}",
             "Base directories",
@@ -2185,7 +2387,7 @@ impl Future for ShutdownOrInactive {
 
 /// Helper future which tracks the `ActiveInfo` below. This future will resolve
 /// once all instances of `ActiveInfo` have been dropped.
-struct WaitUntilZero {
+pub(crate) struct WaitUntilZero {
     info: std::sync::Weak<std::sync::Mutex<Info>>,
 }
 
@@ -2209,7 +2411,7 @@ impl Drop for Info {
 
 impl WaitUntilZero {
     #[rustfmt::skip]
-    fn new() -> (WaitUntilZero, ActiveInfo) {
+    pub(crate) fn new() -> (WaitUntilZero, ActiveInfo) {
         let info = Arc::new(std::sync::Mutex::new(Info { waker: None }));
 
         (WaitUntilZero { info: Arc::downgrade(&info) }, ActiveInfo { info })

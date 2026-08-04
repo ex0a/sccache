@@ -545,7 +545,11 @@ where
             Some(s) if s.len() == 2 => NormalizedDisposition::Concatenated,
             _ => NormalizedDisposition::Separated,
         };
-        args.extend(arg.normalize(norm).iter_os_strings());
+
+        match arg.get_data() {
+            Some(DiagnosticsColor(_)) | Some(DiagnosticsColorFlag) => {}
+            _ => args.extend(arg.normalize(norm).iter_os_strings()),
+        }
     }
 
     let xclang_it = ExpandIncludeFile::new(cwd, &xclangs);
@@ -699,23 +703,27 @@ where
         );
         profile_generate = true;
     }
-    if need_explicit_dep_target {
-        dependency_args.push(dep_flag);
-        dependency_args.push(dep_target.unwrap_or_else(|| output.clone().into_os_string()));
-    }
-    if let DepArgumentRequirePath::Missing = need_explicit_dep_argument_path {
-        dependency_args.push(OsString::from("-MF"));
-        dependency_args.push(Path::new(&output).with_extension("d").into_os_string());
-    }
 
-    if let Some(path) = dep_path {
-        outputs.insert(
-            "d",
-            ArtifactDescriptor {
-                path: path.clone(),
-                optional: false,
-            },
-        );
+    // If the language doesn't need preprocessing, it doesn't generate a dependency file. See issue #2664
+    if language.needs_c_preprocessing() {
+        if need_explicit_dep_target {
+            dependency_args.push(dep_flag);
+            dependency_args.push(dep_target.unwrap_or_else(|| output.clone().into_os_string()));
+        }
+        if let DepArgumentRequirePath::Missing = need_explicit_dep_argument_path {
+            dependency_args.push(OsString::from("-MF"));
+            dependency_args.push(Path::new(&output).with_extension("d").into_os_string());
+        }
+
+        if let Some(path) = dep_path {
+            outputs.insert(
+                "d",
+                ArtifactDescriptor {
+                    path: path.clone(),
+                    optional: false,
+                },
+            );
+        }
     }
 
     if let Some(path) = serialize_diagnostics {
@@ -967,6 +975,10 @@ where
     arguments.extend_from_slice(&parsed_args.unhashed_args);
     arguments.extend_from_slice(&parsed_args.common_args);
     arguments.extend_from_slice(&parsed_args.arch_args);
+
+    if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
+        arguments.push("-fdiagnostics-color=always".into());
+    }
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
@@ -1095,13 +1107,18 @@ impl Iterator for ExpandIncludeFile<'_> {
             //     recursively.
             //
             // So here we interpret any I/O errors as "just return this
-            // argument". Currently we don't implement handling of arguments
-            // with quotes, so if those are encountered we just pass the option
-            // through literally anyway.
+            // argument". On a successful read the contents are tokenized using
+            // the same rules GCC and Clang apply (quotes group an argument and
+            // a backslash escapes the next character) and spliced into the
+            // argument stream in place of the original `@file`. Because the
+            // local and distributed commands are later reconstructed from the
+            // parsed (expanded) arguments, the response file never needs to
+            // exist on a remote machine, so such compilations can be both
+            // cached and distributed.
             //
-            // At this time we interpret all `@` arguments above as non
-            // cacheable, so if we fail to interpret this we'll just call the
-            // compiler anyway.
+            // If the read fails we return the original `@file` argument, which
+            // the parser treats as `TooHard` and refuses to cache, so we fall
+            // back to invoking the compiler directly.
             //
             // [1]: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html#Overall-Options
             let mut contents = String::new();
@@ -1110,18 +1127,79 @@ impl Iterator for ExpandIncludeFile<'_> {
                 debug!("failed to read @-file `{}`: {}", file.display(), e);
                 return Some(arg);
             }
-            if contents.contains('"') || contents.contains('\'') {
-                return Some(arg);
-            }
-            let new_args = contents.split_whitespace().collect::<Vec<_>>();
-            self.stack.extend(new_args.iter().rev().map(|s| s.into()));
+            let new_args = split_gnu_response_file_args(&contents);
+            self.stack.extend(new_args.into_iter().rev());
         }
     }
+}
+
+/// Split the contents of a GCC/Clang `@response` file into arguments.
+///
+/// This mirrors `llvm::cl::TokenizeGNUCommandLine`, the routine Clang (and,
+/// equivalently, GCC) uses to parse response files:
+///
+///  - Arguments are separated by whitespace.
+///  - A single- or double-quoted string is part of a single argument; the
+///    surrounding quotes are removed and may abut unquoted text (`a"b"c` is one
+///    argument `abc`).
+///  - A backslash escapes the following character, which is taken literally.
+///    Backslashes are literal inside single quotes, but still escape inside
+///    double quotes.
+///  - Empty quoted strings (`""`) produce no argument. This matches Clang;
+///    GCC's `buildargv` would instead emit an empty argument, but a bare `""`
+///    argument is meaningless to a compiler so the difference is immaterial.
+///
+/// Whitespace is restricted to ASCII, matching the compilers' own tokenizers
+/// (a non-ASCII Unicode space inside a filename must not split an argument).
+fn split_gnu_response_file_args(contents: &str) -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut token = String::new();
+    let mut chars = contents.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_ascii_whitespace() => {
+                if !token.is_empty() {
+                    args.push(OsString::from(std::mem::take(&mut token)));
+                }
+            }
+            '\\' => {
+                // A backslash escapes the next character, if any.
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            '\'' | '"' => {
+                let quote = c;
+                while let Some(qc) = chars.next() {
+                    if qc == quote {
+                        break;
+                    }
+                    // Backslash escapes inside double-quoted strings only.
+                    if quote == '"' && qc == '\\' {
+                        if let Some(next) = chars.next() {
+                            token.push(next);
+                        }
+                    } else {
+                        token.push(qc);
+                    }
+                }
+            }
+            c => token.push(c),
+        }
+    }
+
+    if !token.is_empty() {
+        args.push(OsString::from(token));
+    }
+
+    args
 }
 
 #[cfg(test)]
 mod test {
     use fs::File;
+    use itertools::assert_equal;
     use std::io::Write;
 
     use super::*;
@@ -1402,6 +1480,62 @@ mod test {
         assert_eq!(ovec!["--coverage"], common_args);
         assert!(!msvc_show_includes);
         assert!(profile_generate);
+    }
+
+    #[test]
+    fn test_parse_arguments_depfile_for_raw_assembly_gcc() {
+        let args = stringvec!["-c", "foo.s", "-o", "foo.o", "-MD", "-MF", "foo.d"];
+        let ParsedArguments {
+            input,
+            language,
+            outputs,
+            preprocessor_args,
+            ..
+        } = match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Some("foo.s"), input.to_str());
+        assert_eq!(Language::Assembler, language);
+        assert_equal(
+            outputs,
+            vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )],
+        );
+        assert!(preprocessor_args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_arguments_depfile_for_preprocessed_c_clang() {
+        let args = stringvec!["-c", "foo.i", "-o", "foo.o", "-MD", "-MF", "foo.d"];
+        let ParsedArguments {
+            input,
+            language,
+            outputs,
+            preprocessor_args,
+            ..
+        } = match parse_arguments_clang(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Some("foo.i"), input.to_str());
+        assert_eq!(Language::CPreprocessed, language);
+        assert_equal(
+            outputs,
+            vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )],
+        );
+        assert!(preprocessor_args.is_empty());
     }
 
     #[test]
@@ -1858,7 +1992,7 @@ mod test {
             o => panic!("Got unexpected parse result: {:?}", o),
         };
 
-        assert!(args.common_args.contains(&"-fdiagnostics-color".into()));
+        assert!(!args.common_args.contains(&"-fdiagnostics-color".into()));
     }
 
     #[test]
@@ -2357,6 +2491,88 @@ mod test {
     }
 
     #[test]
+    fn test_split_gnu_response_file_args() {
+        // Plain whitespace separation, including newlines and tabs.
+        assert_eq!(
+            ovec!["-c", "foo.c", "-o", "foo.o"],
+            split_gnu_response_file_args("-c foo.c\n\t-o  foo.o\n")
+        );
+        // Quotes group an argument and are stripped.
+        assert_eq!(
+            ovec!["-I", "/a path/with spaces", "-DFOO=bar baz"],
+            split_gnu_response_file_args("-I \"/a path/with spaces\" '-DFOO=bar baz'")
+        );
+        // Quotes may abut unquoted text.
+        assert_eq!(
+            ovec!["-DA=a b c"],
+            split_gnu_response_file_args("-DA=\"a b c\"")
+        );
+        // Backslash escapes the next character outside quotes.
+        assert_eq!(
+            ovec!["a b", "c\\d"],
+            split_gnu_response_file_args("a\\ b c\\\\d")
+        );
+        // Backslash escapes inside double quotes but not single quotes.
+        assert_eq!(
+            ovec!["a\"b", "c\\d"],
+            split_gnu_response_file_args("\"a\\\"b\" 'c\\d'")
+        );
+        // Empty quoted strings produce no argument.
+        assert_eq!(
+            ovec!["-c", "foo.c"],
+            split_gnu_response_file_args("-c \"\" foo.c")
+        );
+        // Empty or whitespace-only input produces no arguments.
+        assert!(split_gnu_response_file_args("").is_empty());
+        assert!(split_gnu_response_file_args("   \n\t").is_empty());
+        // A trailing backslash with nothing to escape is dropped.
+        assert_eq!(ovec!["foo"], split_gnu_response_file_args("foo\\"));
+        // A trailing backslash at the end of a double-quoted string is dropped.
+        assert_eq!(ovec!["x"], split_gnu_response_file_args("\"x\\"));
+        // An unterminated quote consumes the rest of the input as one argument.
+        assert_eq!(ovec!["abc"], split_gnu_response_file_args("\"abc"));
+        assert_eq!(ovec!["a b"], split_gnu_response_file_args("'a b"));
+    }
+
+    #[test]
+    fn test_parse_arguments_response_file_with_quotes() {
+        // A response file containing quoted arguments (common with Clang) must
+        // be expanded and remain cacheable.
+        let td = tempfile::Builder::new()
+            .prefix("sccache")
+            .tempdir()
+            .unwrap();
+        File::create(td.path().join("args"))
+            .unwrap()
+            .write_all(b"-c foo.c -o foo.o \"-DGREETING=hello world\"\n")
+            .unwrap();
+        let arg = format!("@{}", td.path().join("args").display());
+        let ParsedArguments {
+            input,
+            language,
+            outputs,
+            common_args,
+            ..
+        } = match parse_arguments_(vec![arg], false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Some("foo.c"), input.to_str());
+        assert_eq!(Language::C, language);
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false
+                }
+            )
+        );
+        assert_eq!(ovec!["-DGREETING=hello world"], common_args);
+    }
+
+    #[test]
     fn test_compile_simple() {
         let creator = new_creator();
         let f = TestFixture::new();
@@ -2556,7 +2772,16 @@ mod test {
             language_to_gcc_arg,
         )
         .unwrap();
-        let expected_args = ovec!["-x", "c", "-c", "-o", "foo.o", "--", "foo.c"];
+        let expected_args = ovec![
+            "-x",
+            "c",
+            "-c",
+            "-o",
+            "foo.o",
+            "-fdiagnostics-color=always",
+            "--",
+            "foo.c"
+        ];
         assert_eq!(command.get_arguments(), expected_args);
     }
 

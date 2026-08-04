@@ -24,10 +24,12 @@ pub mod disk;
 pub mod gcs;
 #[cfg(feature = "gha")]
 pub mod gha;
+pub mod ipc_storage;
 #[allow(clippy::module_inception)]
 pub mod lazy_disk_cache;
 #[cfg(feature = "memcached")]
 pub mod memcached;
+pub mod multilevel;
 #[cfg(feature = "oss")]
 pub mod oss;
 pub mod readonly;
@@ -52,4 +54,6 @@ pub(crate) mod http_client;
 
 pub use crate::cache::cache::*;
 pub use crate::cache::cache_io::*;
+pub use crate::cache::ipc_storage::IpcStorage;
 pub use crate::cache::lazy_disk_cache::*;
+pub use crate::cache::multilevel::MultiLevelStorage;
